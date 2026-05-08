@@ -1,31 +1,50 @@
 const PICTIFY_UPLOAD_URL = 'https://deft-croissant-f7506d.netlify.app/upload?from=extension';
 
-// ── Register context menu on install ─────────────────────────
+// ── Register context menu on install / update ─────────────────
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.contextMenus.create({
-    id: 'printOnPictify',
-    title: '🖨️ Print on Pictify',
-    contexts: ['image'],
+  // Remove any stale entries first
+  chrome.contextMenus.removeAll(() => {
+    chrome.contextMenus.create({
+      id: 'printOnPictify',
+      title: '🖨️ Print on Pictify',
+      // 'page' catches right-clicks on overlays; 'image' catches direct <img>
+      contexts: ['page', 'image', 'link'],
+    });
   });
 });
 
-// ── Handle right-click → "Print on Pictify" ───────────────────
-chrome.contextMenus.onClicked.addListener(async (info) => {
+// ── Handle right-click ────────────────────────────────────────
+chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId !== 'printOnPictify') return;
 
-  const srcUrl = info.srcUrl;
-  if (!srcUrl) return;
+  // 1. Prefer the URL Chrome detected directly (works on bare <img> tags)
+  let srcUrl = info.srcUrl || null;
 
+  // 2. If no direct srcUrl (e.g. right-clicked an overlay), ask the
+  //    content script what image was under the cursor
+  if (!srcUrl && tab?.id) {
+    try {
+      const response = await chrome.tabs.sendMessage(tab.id, { type: 'getLastImage' });
+      srcUrl = response?.url || null;
+    } catch (_) {
+      // Content script not yet injected on this page (e.g. chrome:// page)
+    }
+  }
+
+  if (!srcUrl) {
+    console.warn('Pictify: no image found at right-click position.');
+    return;
+  }
+
+  // 3. Fetch the image (extensions bypass CORS with <all_urls> permission)
   try {
-    // Fetch the image — extensions bypass CORS with <all_urls> permission
     const response = await fetch(srcUrl);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
     const blob = await response.blob();
 
-    // Guard: skip if > 4 MB (storage quota protection)
+    // Guard: if > 4 MB store as URL instead (storage quota)
     if (blob.size > 4 * 1024 * 1024) {
-      console.warn('Pictify: image too large for storage, passing URL instead.');
       openPictify({ url: srcUrl });
       return;
     }
@@ -34,46 +53,31 @@ chrome.contextMenus.onClicked.addListener(async (info) => {
     openPictify({ base64 });
 
   } catch (err) {
-    // Fallback: pass the raw URL — Upload page will attempt to load it
     console.warn('Pictify: fetch failed, falling back to URL.', err.message);
     openPictify({ url: srcUrl });
   }
 });
 
-// ── Convert Blob → base64 data URL ───────────────────────────
+// ── Blob → base64 data URL ─────────────────────────────────────
 function blobToBase64(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReaderSync?.();
-    if (reader) {
-      // FileReaderSync is available in some service worker contexts
-      try {
-        const dataUrl = reader.readAsDataURL(blob);
-        resolve(dataUrl);
-        return;
-      } catch (_) {}
+  return blob.arrayBuffer().then(buffer => {
+    const uint8 = new Uint8Array(buffer);
+    let binary = '';
+    const chunkSize = 8192;
+    for (let i = 0; i < uint8.length; i += chunkSize) {
+      binary += String.fromCharCode(...uint8.subarray(i, i + chunkSize));
     }
-
-    // Fallback: ArrayBuffer → btoa in chunks
-    blob.arrayBuffer().then(buffer => {
-      const uint8 = new Uint8Array(buffer);
-      let binary = '';
-      const chunk = 8192;
-      for (let i = 0; i < uint8.length; i += chunk) {
-        binary += String.fromCharCode(...uint8.subarray(i, i + chunk));
-      }
-      resolve(`data:${blob.type || 'image/jpeg'};base64,${btoa(binary)}`);
-    }).catch(reject);
+    return `data:${blob.type || 'image/jpeg'};base64,${btoa(binary)}`;
   });
 }
 
-// ── Open Pictify upload page and inject image ─────────────────
+// ── Open Pictify and inject the image ────────────────────────
 function openPictify({ base64 = null, url = null }) {
   chrome.tabs.create({ url: PICTIFY_UPLOAD_URL }, (tab) => {
     const listener = (tabId, changeInfo) => {
       if (tabId !== tab.id || changeInfo.status !== 'complete') return;
       chrome.tabs.onUpdated.removeListener(listener);
 
-      // Inject the image into the page via localStorage + CustomEvent
       chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func: (b64, fallbackUrl) => {
@@ -82,7 +86,6 @@ function openPictify({ base64 = null, url = null }) {
           } else if (fallbackUrl) {
             localStorage.setItem('pictifyExtImageUrl', fallbackUrl);
           }
-          // Dispatch event in case the page has already mounted
           window.dispatchEvent(new CustomEvent('pictifyExtImage'));
         },
         args: [base64, url],
